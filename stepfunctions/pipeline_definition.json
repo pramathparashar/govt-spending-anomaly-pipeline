@@ -1,0 +1,92 @@
+{
+  "Comment": "Government Contract Spending Anomaly Detection Pipeline",
+  "StartAt": "Start Glue Crawler",
+  "States": {
+    "Start Glue Crawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": {
+        "Name": "govt-spending-crawler"
+      },
+      "Next": "Wait For Crawler",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Glue.CrawlerRunningException"
+          ],
+          "Next": "Wait For Crawler"
+        }
+      ]
+    },
+    "Wait For Crawler": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "Check Crawler Status"
+    },
+    "Check Crawler Status": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "govt-spending-crawler"
+      },
+      "Next": "Is Crawler Complete"
+    },
+    "Is Crawler Complete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "Start Glue ETL Job"
+        }
+      ],
+      "Default": "Wait For Crawler"
+    },
+    "Start Glue ETL Job": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "govt-spending-etl-job"
+      },
+      "Next": "Pipeline Success",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Pipeline Failed"
+        }
+      ]
+    },
+    "Pipeline Success": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+      "Parameters": {
+        "Namespace": "GovtSpendingPipeline",
+        "MetricData": [
+          {
+            "MetricName": "PipelineSuccess",
+            "Value": 1,
+            "Unit": "Count"
+          }
+        ]
+      },
+      "End": true
+    },
+    "Pipeline Failed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+      "Parameters": {
+        "Namespace": "GovtSpendingPipeline",
+        "MetricData": [
+          {
+            "MetricName": "PipelineFailure",
+            "Value": 1,
+            "Unit": "Count"
+          }
+        ]
+      },
+      "End": true
+    }
+  }
+}
