@@ -1,0 +1,487 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  US Government Contract Spending Anomaly Detection Pipeline
+  End-to-end real-time AWS data pipeline that ingests live federal contract
+  data from USASpending.gov, detects anomalous spending patterns, and loads
+  results into Redshift Serverless for analysis.
+  Author: Pramath Parashar | AWS Certified DEA-C01
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: govt-spending
+    Description: Project prefix used for all resource names
+
+  OwnerName:
+    Type: String
+    Default: pramath
+    Description: Owner name appended to S3 bucket names for uniqueness
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  RedshiftAdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    Description: Admin password for Redshift Serverless (8-64 chars, upper+lower+number)
+
+  GlueScriptBucket:
+    Type: String
+    Description: S3 bucket where Glue ETL script is stored
+    Default: aws-glue-assets
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # S3 BUCKETS — Three-layer data lake (Raw / Processed / Curated)
+  # ───────────────────────────────────────────────────────────────────────────
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-pipeline-raw-${OwnerName}-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-raw-to-glacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Layer
+          Value: Raw
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-${OwnerName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Layer
+          Value: Processed
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-curated-${OwnerName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Layer
+          Value: Curated
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # IAM ROLES — Least privilege per service
+  # ───────────────────────────────────────────────────────────────────────────
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonKinesisReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RedshiftS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-redshift-s3-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # KINESIS DATA STREAM
+  # ───────────────────────────────────────────────────────────────────────────
+
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-stream'
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+      RetentionPeriodHours: 24
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # LAMBDA FUNCTION
+  # ───────────────────────────────────────────────────────────────────────────
+
+  ValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-validator'
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          # Placeholder — deploy actual code from lambda/validator.py
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Deploy actual validator.py'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaKinesisTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt KinesisStream.Arn
+      FunctionName: !GetAtt ValidatorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      Enabled: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # GLUE DATA CATALOG + CRAWLERS + ETL JOB
+  # ───────────────────────────────────────────────────────────────────────────
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}-db'
+        Description: Glue Data Catalog database for government spending pipeline
+
+  GlueCrawlerRaw:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-crawler'
+      Role: !GetAtt GlueExecutionRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${RawBucket}/raw/contracts/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      Tags:
+        Project: !Ref ProjectName
+
+  GlueCrawlerProcessed:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-processed-crawler'
+      Role: !GetAtt GlueExecutionRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedBucket}/processed/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      Tags:
+        Project: !Ref ProjectName
+
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-etl-job'
+      Role: !GetAtt GlueExecutionRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptBucket}/scripts/${ProjectName}-etl-job.py'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--TempDir': !Sub 's3://${GlueScriptBucket}/temporary/'
+      Tags:
+        Project: !Ref ProjectName
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # REDSHIFT SERVERLESS
+  # ───────────────────────────────────────────────────────────────────────────
+
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub '${ProjectName}-namespace'
+      AdminUsername: awsuser
+      AdminUserPassword: !Ref RedshiftAdminPassword
+      DbName: dev
+      DefaultIamRoleArn: !GetAtt RedshiftS3Role.Arn
+      IamRoles:
+        - !GetAtt RedshiftS3Role.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub '${ProjectName}-workgroup'
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: 4
+      PubliclyAccessible: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # STEP FUNCTIONS STATE MACHINE
+  # ───────────────────────────────────────────────────────────────────────────
+
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-pipeline'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      Definition:
+        Comment: Government Contract Spending Anomaly Detection Pipeline
+        StartAt: Start Glue Crawler
+        States:
+          Start Glue Crawler:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:glue:startCrawler
+            Parameters:
+              Name: !Sub '${ProjectName}-crawler'
+            Next: Wait For Crawler
+            Catch:
+              - ErrorEquals: [Glue.CrawlerRunningException]
+                Next: Wait For Crawler
+          Wait For Crawler:
+            Type: Wait
+            Seconds: 60
+            Next: Check Crawler Status
+          Check Crawler Status:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:glue:getCrawler
+            Parameters:
+              Name: !Sub '${ProjectName}-crawler'
+            Next: Is Crawler Complete
+          Is Crawler Complete:
+            Type: Choice
+            Choices:
+              - Variable: $.Crawler.State
+                StringEquals: READY
+                Next: Start Glue ETL Job
+            Default: Wait For Crawler
+          Start Glue ETL Job:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Sub '${ProjectName}-etl-job'
+            Next: Pipeline Success
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Next: Pipeline Failed
+          Pipeline Success:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:cloudwatch:putMetricData
+            Parameters:
+              Namespace: GovtSpendingPipeline
+              MetricData:
+                - MetricName: PipelineSuccess
+                  Value: 1
+                  Unit: Count
+            End: true
+          Pipeline Failed:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:cloudwatch:putMetricData
+            Parameters:
+              Namespace: GovtSpendingPipeline
+              MetricData:
+                - MetricName: PipelineFailure
+                  Value: 1
+                  Unit: Count
+            End: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # CLOUDWATCH ALARM
+  # ───────────────────────────────────────────────────────────────────────────
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-error-rate-alarm'
+      AlarmDescription: Triggers when Lambda validator errors exceed 5 in 5 minutes
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ValidatorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  RawBucketName:
+    Description: S3 Raw Layer bucket name
+    Value: !Ref RawBucket
+    Export:
+      Name: !Sub '${ProjectName}-raw-bucket'
+
+  ProcessedBucketName:
+    Description: S3 Processed Layer bucket name
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub '${ProjectName}-processed-bucket'
+
+  CuratedBucketName:
+    Description: S3 Curated Layer bucket name
+    Value: !Ref CuratedBucket
+    Export:
+      Name: !Sub '${ProjectName}-curated-bucket'
+
+  KinesisStreamArn:
+    Description: Kinesis Data Stream ARN
+    Value: !GetAtt KinesisStream.Arn
+    Export:
+      Name: !Sub '${ProjectName}-kinesis-arn'
+
+  LambdaFunctionArn:
+    Description: Lambda Validator Function ARN
+    Value: !GetAtt ValidatorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-arn'
+
+  RedshiftWorkgroupEndpoint:
+    Description: Redshift Serverless workgroup endpoint
+    Value: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-redshift-endpoint'
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref PipelineStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-statemachine-arn'

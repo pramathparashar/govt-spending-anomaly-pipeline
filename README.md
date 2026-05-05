@@ -110,8 +110,8 @@ govt-spending-anomaly-pipeline/
     queries/
         anomaly_analysis.sql     -- 7 analytical queries
     stepfunctions/
-        pipeline_definition.json -- State machine definition
-    screenshots/                 -- Pipeline execution evidence
+        pipeline_definition.json -- Step Functions state machine JSON definition
+    screenshots/                 -- Pipeline execution evidence (14 screenshots)
     README.md
 ```
 
@@ -184,6 +184,7 @@ All 13 screenshots of the working pipeline are included in the screenshots/ fold
 - 11-redshift-data-loaded.png — 600 records loaded into Redshift
 - 12-redshift-query-results.png — Agency spending breakdown query
 - 13-redshift-anomaly-results.png — Boeing $22.4B anomaly detected
+- 14-step-functions-flow-diagram.png — Visual pipeline orchestration flow
 
 ---
 
