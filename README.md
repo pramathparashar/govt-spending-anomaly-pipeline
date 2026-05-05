@@ -111,6 +111,8 @@ govt-spending-anomaly-pipeline/
         anomaly_analysis.sql     -- 7 analytical queries
     stepfunctions/
         pipeline_definition.json -- Step Functions state machine JSON definition
+    iac/
+        cloudformation_template.yaml -- Full infrastructure as code (CloudFormation)
     screenshots/                 -- Pipeline execution evidence (14 screenshots)
     README.md
 ```
@@ -237,6 +239,7 @@ Three real production issues were debugged and resolved during this build:
 - Implement real-time alerting via SNS for high-score anomalies
 - Add dbt for data transformation layer
 - Expand to grants and loans data from USASpending.gov
+- Deploy infrastructure via CloudFormation instead of manual console setup
 
 ---
 
