@@ -47,6 +47,12 @@ Cross-cutting services:
 
 ---
 
+## Architecture Decision — Why Kinesis
+
+USASpending.gov currently updates once daily, making EventBridge Scheduler + Lambda the cost-optimal choice for this ingestion frequency. Kinesis was deliberately chosen to demonstrate streaming ingestion patterns and to future-proof the pipeline — if the data source added webhooks or if ingestion frequency increased to sub-hourly polling across multiple endpoints simultaneously, Kinesis provides replay capability, ordering guarantees, and fan-out to multiple consumers without re-architecting. At daily frequency, the cost premium is ~$0.36/day per shard.
+
+---
+
 ## Business Problem
 
 The US federal government awards $700B+ in contracts annually. Detecting anomalous or potentially wasteful spending manually is impossible at scale. This pipeline automates anomaly detection using three custom scoring rules applied to real-time data.
@@ -239,7 +245,6 @@ Three real production issues were debugged and resolved during this build:
 - Implement real-time alerting via SNS for high-score anomalies
 - Add dbt for data transformation layer
 - Expand to grants and loans data from USASpending.gov
-- Deploy infrastructure via CloudFormation instead of manual console setup
 
 ---
 
